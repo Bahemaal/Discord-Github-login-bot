@@ -1,26 +1,30 @@
-import asyncio
 import os
+import secrets
 import sqlite3
 import time
+from html import escape
+from urllib.parse import urlencode
 
 import aiohttp
 import discord
+from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GITHUB_CLIENT_ID = os.environ["GITHUB_CLIENT_ID"]
+GITHUB_CLIENT_SECRET = os.environ["GITHUB_CLIENT_SECRET"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]  # "owner/name"
 CONTRIBUTOR_ROLE_ID = int(os.environ["CONTRIBUTOR_ROLE_ID"])
 PANEL_CHANNEL_ID = int(os.environ["PANEL_CHANNEL_ID"])  # channel where the button message lives
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8080").rstrip("/")
+PORT = int(os.environ.get("PORT", "8080"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # optional, raises the API rate limit
 
+REDIRECT_URI = f"{PUBLIC_URL}/callback"
+STATE_TTL = 600  # seconds the user has to finish GitHub authorization
 MAX_CONTRIBUTOR_PAGES = 10  # 10 * 100 = up to 1000 contributors
-# Discord interaction tokens live 15 minutes, keep a safety margin
-MAX_FLOW_SECONDS = 14 * 60
-
-GITHUB_JSON = {"Accept": "application/json"}
 
 
 # ---------- DB: GitHub <-> Discord links + panel message id ----------
@@ -33,57 +37,25 @@ db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NO
 db.commit()
 
 
-# ---------- GitHub Device Flow ----------
-class FlowError(Exception):
-    """An error whose message is safe to show to the user."""
-
-
-async def request_device_code(session: aiohttp.ClientSession) -> dict:
+# ---------- GitHub API ----------
+async def exchange_code(session: aiohttp.ClientSession, code: str) -> str:
     async with session.post(
-        "https://github.com/login/device/code",
-        headers=GITHUB_JSON,
-        data={"client_id": GITHUB_CLIENT_ID},
+        "https://github.com/login/oauth/access_token",
+        headers={"Accept": "application/json"},
+        json={
+            "client_id": GITHUB_CLIENT_ID,
+            "client_secret": GITHUB_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+        },
     ) as r:
         data = await r.json()
-    if "device_code" not in data:
-        # most common cause: "Enable Device Flow" is not ticked in the OAuth App settings
-        raise RuntimeError(f"Device code request failed: {data}")
-    return data
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError(f"GitHub did not return a token: {data.get('error_description', data)}")
+    return token
 
 
-async def poll_for_token(session: aiohttp.ClientSession, device_code: str, interval: int, deadline: float) -> str:
-    while time.monotonic() < deadline:
-        await asyncio.sleep(interval)
-        async with session.post(
-            "https://github.com/login/oauth/access_token",
-            headers=GITHUB_JSON,
-            data={
-                "client_id": GITHUB_CLIENT_ID,
-                "device_code": device_code,
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            },
-        ) as r:
-            data = await r.json()
-
-        if "access_token" in data:
-            return data["access_token"]
-
-        error = data.get("error")
-        if error == "authorization_pending":
-            continue
-        if error == "slow_down":
-            interval = data.get("interval", interval + 5)
-            continue
-        if error == "access_denied":
-            raise FlowError("Authorization was cancelled on GitHub.")
-        if error == "expired_token":
-            break
-        raise RuntimeError(f"Unexpected GitHub response: {data}")
-
-    raise FlowError("The code has expired. Press the button again to get a new one.")
-
-
-# ---------- GitHub API ----------
 async def get_github_login(session: aiohttp.ClientSession, user_token: str) -> str:
     async with session.get(
         "https://api.github.com/user",
@@ -93,8 +65,10 @@ async def get_github_login(session: aiohttp.ClientSession, user_token: str) -> s
         return (await r.json())["login"]
 
 
-async def is_contributor(session: aiohttp.ClientSession, login: str, api_token: str) -> bool:
-    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {api_token}"}
+async def is_contributor(session: aiohttp.ClientSession, login: str) -> bool:
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
     target = login.lower()
     for page in range(1, MAX_CONTRIBUTOR_PAGES + 1):
@@ -115,78 +89,7 @@ async def is_contributor(session: aiohttp.ClientSession, login: str, api_token: 
     return False
 
 
-# ---------- Verification flow ----------
-async def respond(interaction: discord.Interaction, content: str, view: discord.ui.View | None):
-    """Update the private (ephemeral) message the user is looking at."""
-    try:
-        await interaction.edit_original_response(content=content, view=view)
-    except discord.HTTPException as e:
-        print("Could not update ephemeral message:", e)
-
-
-async def grant_role(interaction: discord.Interaction, login: str) -> str:
-    """Assign the role and remember the link. Returns the text to show the user."""
-    row = db.execute("SELECT discord_id FROM links WHERE github_login = ?", (login.lower(),)).fetchone()
-    if row and row[0] != interaction.user.id:
-        return "This GitHub account is already linked to another Discord user."
-
-    guild = interaction.guild
-    role = guild.get_role(CONTRIBUTOR_ROLE_ID)
-    if not role:
-        return "The contributor role was not found. Please contact an admin."
-
-    try:
-        member = await guild.fetch_member(interaction.user.id)
-        await member.add_roles(role, reason=f"GitHub contributor: {login}")
-    except discord.HTTPException as e:
-        print("Discord error:", e)
-        return "Could not assign the role. Please contact an admin."
-
-    db.execute(
-        "INSERT OR REPLACE INTO links (github_login, discord_id) VALUES (?, ?)",
-        (login.lower(), interaction.user.id),
-    )
-    db.commit()
-    return f"Verified as **{login}**. The contributor role has been assigned!"
-
-
-async def verify_flow(interaction: discord.Interaction):
-    try:
-        async with aiohttp.ClientSession() as session:
-            data = await request_device_code(session)
-
-            seconds = min(int(data["expires_in"]), MAX_FLOW_SECONDS)
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(label="Open GitHub", url=data["verification_uri"]))
-            await respond(
-                interaction,
-                f"Open GitHub, enter this code and confirm:\n# `{data['user_code']}`\n"
-                f"The code is valid for {seconds // 60} minutes. "
-                "The role is assigned automatically as soon as you're done.",
-                view,
-            )
-
-            user_token = await poll_for_token(
-                session, data["device_code"], int(data.get("interval", 5)), time.monotonic() + seconds
-            )
-            login = await get_github_login(session, user_token)
-            contributor = await is_contributor(session, login, GITHUB_TOKEN or user_token)
-
-        if contributor:
-            text = await grant_role(interaction, login)
-        else:
-            text = "You are not a contributor to this project."
-    except FlowError as e:
-        text = str(e)
-    except asyncio.CancelledError:
-        raise  # a newer click replaced this flow, say nothing
-    except Exception as e:
-        print("Verification error:", repr(e))
-        text = "Something went wrong while talking to GitHub. Please try again later."
-
-    await respond(interaction, text, None)
-
-
+# ---------- Discord UI ----------
 class VerifyView(discord.ui.View):
     """Persistent view: the button keeps working after bot restarts."""
 
@@ -204,30 +107,58 @@ class VerifyView(discord.ui.View):
             await interaction.response.send_message("You already have the contributor role.", ephemeral=True)
             return
 
-        # thinking=True is required: for button clicks a plain defer() means "edit the
-        # message the button is on", which would overwrite the public panel
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        state = secrets.token_urlsafe(32)
+        # keep the interaction so we can send a private (ephemeral) follow-up later
+        bot.pending[state] = (interaction, time.time() + STATE_TTL)
 
-        # a new click replaces the user's previous unfinished attempt
-        uid = interaction.user.id
-        old = bot.active.get(uid)
-        if old and not old.done():
-            old.cancel()
+        url = "https://github.com/login/oauth/authorize?" + urlencode(
+            {"client_id": GITHUB_CLIENT_ID, "redirect_uri": REDIRECT_URI, "state": state}
+        )
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="Continue to GitHub", url=url))
+        await interaction.response.send_message(
+            f"Sign in with GitHub to verify that you contribute to `{GITHUB_REPO}`. "
+            f"The link is valid for {STATE_TTL // 60} minutes.",
+            view=view,
+            ephemeral=True,
+        )
 
-        task = asyncio.create_task(verify_flow(interaction))
-        bot.active[uid] = task
-        task.add_done_callback(lambda t, uid=uid: bot.active.pop(uid, None) if bot.active.get(uid) is t else None)
+
+async def notify(interaction: discord.Interaction, text: str):
+    """Private message only the clicking user can see."""
+    try:
+        await interaction.followup.send(text, ephemeral=True)
+    except discord.HTTPException as e:
+        print("Follow-up failed:", e)
+
+
+def page(message: str, status: int = 200) -> web.Response:
+    html = (
+        "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<body style='font-family:sans-serif;max-width:480px;margin:15vh auto;padding:0 16px;text-align:center'>"
+        f"<p style='font-size:1.2rem'>{message}</p>"
+        "<p style='color:#666'>You can close this tab and return to Discord.</p></body>"
+    )
+    return web.Response(text=html, status=status, content_type="text/html")
 
 
 # ---------- Bot ----------
 class Bot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
-        self.active: dict[int, asyncio.Task] = {}
+        # state -> (interaction, expires_at)
+        self.pending: dict[str, tuple[discord.Interaction, float]] = {}
         self._panel_checked = False
 
     async def setup_hook(self):
         self.add_view(VerifyView())
+
+        app = web.Application()
+        app.add_routes([web.get("/callback", self.handle_callback)])
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+        print(f"OAuth callback listening on :{PORT}")
 
     async def on_ready(self):
         print(f"Logged in as {self.user}")
@@ -238,28 +169,86 @@ class Bot(discord.Client):
     async def ensure_panel(self):
         """Post the button message once; repost only if it was deleted."""
         channel = self.get_channel(PANEL_CHANNEL_ID) or await self.fetch_channel(PANEL_CHANNEL_ID)
-        embed = discord.Embed(
-            title="Contributor verification",
-            description=(
-                f"Are you a contributor to **{GITHUB_REPO}**?\n"
-                "Press the button, confirm a short code on GitHub and get the contributor role."
-            ),
-            color=0x238636,
-        )
-
         row = db.execute("SELECT value FROM meta WHERE key = 'panel_message_id'").fetchone()
         if row:
             try:
-                existing = await channel.fetch_message(int(row[0]))
-                # restore content/button in case the message was edited or damaged
-                await existing.edit(content=None, embed=embed, view=VerifyView())
+                await channel.fetch_message(int(row[0]))
                 return
             except discord.NotFound:
                 pass
 
+        embed = discord.Embed(
+            title="Contributor verification",
+            description=(
+                f"Are you a contributor to **{GITHUB_REPO}**?\n"
+                "Press the button, sign in with GitHub and get the contributor role."
+            ),
+            color=0x238636,
+        )
         msg = await channel.send(embed=embed, view=VerifyView())
         db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('panel_message_id', ?)", (str(msg.id),))
         db.commit()
+
+    def cleanup_pending(self):
+        now = time.time()
+        for s in [s for s, (_, exp) in self.pending.items() if exp < now]:
+            del self.pending[s]
+
+    async def handle_callback(self, request: web.Request) -> web.Response:
+        code = request.query.get("code")
+        state = request.query.get("state")
+        self.cleanup_pending()
+
+        pending = self.pending.pop(state, None) if state else None
+        if not code or not pending:
+            return page("This link is invalid or has expired. Press the button in Discord again.", 400)
+        interaction, _ = pending
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                user_token = await exchange_code(session, code)
+                login = await get_github_login(session, user_token)
+                contributor = await is_contributor(session, login)
+        except Exception as e:
+            print("GitHub error:", e)
+            await notify(interaction, "Could not reach GitHub. Please try again later.")
+            return page("Could not reach GitHub. Please try again later.", 502)
+
+        if not contributor:
+            await notify(interaction, "You are not a contributor to this project.")
+            return page("You are not a contributor to this project.", 403)
+
+        # one GitHub account -> one Discord account
+        row = db.execute(
+            "SELECT discord_id FROM links WHERE github_login = ?", (login.lower(),)
+        ).fetchone()
+        if row and row[0] != interaction.user.id:
+            msg = "This GitHub account is already linked to another Discord user."
+            await notify(interaction, msg)
+            return page(msg, 409)
+
+        guild = interaction.guild
+        role = guild.get_role(CONTRIBUTOR_ROLE_ID)
+        if not role:
+            await notify(interaction, "The contributor role was not found. Please contact an admin.")
+            return page("Role not found. Please contact an admin.", 500)
+
+        try:
+            member = await guild.fetch_member(interaction.user.id)
+            await member.add_roles(role, reason=f"GitHub contributor: {login}")
+        except discord.HTTPException as e:
+            print("Discord error:", e)
+            await notify(interaction, "Could not assign the role. Please contact an admin.")
+            return page("Could not assign the role. Please contact an admin.", 500)
+
+        db.execute(
+            "INSERT OR REPLACE INTO links (github_login, discord_id) VALUES (?, ?)",
+            (login.lower(), interaction.user.id),
+        )
+        db.commit()
+
+        await notify(interaction, f"Verified as **{login}**. The contributor role has been assigned!")
+        return page(f"Verified as <b>{escape(login)}</b>. Role assigned!")
 
 
 bot = Bot()
